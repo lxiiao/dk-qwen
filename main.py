@@ -2,6 +2,7 @@ from modelscope import AutoModelForCausalLM, AutoTokenizer
 import os
 from flask import Flask, request, jsonify
 import time
+import torch
 
 # 设置自定义缓存目录
 os.environ['MODELSCOPE_CACHE'] = './custom_modelscope_cache'
@@ -18,9 +19,16 @@ def load_model():
     # 模型名称
     model_name = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
 
+    print("开始加载模型...")
     # 加载分词器和模型
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForCausalLM.from_pretrained(model_name)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        device_map="auto",  # 自动选择最优设备
+        torch_dtype=torch.float16  # 使用float16以减少显存占用
+    )
+    print(f"模型加载完成，使用设备: {model.device}")
+    model.eval()  # 设置为评估模式
 
 
 @app.route('/')
@@ -59,15 +67,16 @@ def chat_completions():
         start_time = time.time()
 
         # 将输入文本编码为模型输入
-        inputs = tokenizer(input_text, return_tensors="pt")
+        inputs = tokenizer(input_text, return_tensors="pt").to(model.device)
 
-        # 生成输出
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=512,
-            temperature=data.get('temperature', 0.7),
-            top_p=data.get('top_p', 1.0),
-        )
+        # 使用no_grad进行推理
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=512,
+                temperature=data.get('temperature', 0.7),
+                top_p=data.get('top_p', 1.0),
+            )
 
         # 解码输出为文本
         output_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
