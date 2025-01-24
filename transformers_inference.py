@@ -1,5 +1,4 @@
-from vllm import LLM, SamplingParams, LLMEngine
-from modelscope import AutoModelForCausalLM, AutoTokenizer, snapshot_download
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from typing import Union
 import os
 from flask import Flask, request, jsonify
@@ -7,6 +6,7 @@ import time
 import logging
 from queue import Queue
 import threading
+import torch
 
 # 设置自定义缓存目录
 os.environ['MODELSCOPE_CACHE'] = './custom_modelscope_cache'
@@ -16,7 +16,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('vllm_api.log'),
+        logging.FileHandler('transformers_api.log'),
         logging.StreamHandler()
     ]
 )
@@ -24,57 +24,50 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# 全局LLM实例
-global_llm = None
-
+# 全局模型和tokenizer实例
+global_model = None
+global_tokenizer = None
 request_queue = Queue()
 processing_lock = threading.Lock()
 
-def initialize_llm():
-    global global_llm
-    if global_llm is None:
-        logger.info("正在初始化全局LLM实例")
-        model_dir = snapshot_download('deepseek-ai/DeepSeek-R1-Distill-Qwen-14B')
-        global_llm = LLM(
-            model=model_dir,
-            max_model_len=8192,
-            gpu_memory_utilization=0.9,
-            tensor_parallel_size=1,  # 使用1个GPU
-            max_num_batched_tokens=16384,  # 增加批处理token数量
-            max_num_seqs=32,  # 适当降低最大序列数
-            enable_prefix_caching=True,  # 启用前缀缓存
-            enforce_eager=True  # 启用eager模式
+def initialize_model():
+    global global_model, global_tokenizer
+    if global_model is None:
+        logger.info("正在初始化全局模型实例")
+        # 使用本地已下载的模型文件
+        model_dir = './custom_modelscope_cache/hub/deepseek-ai/DeepSeek-R1-Distill-Qwen-32B'
+        global_model = AutoModelForCausalLM.from_pretrained(
+            model_dir,
+            device_map="auto",
+            torch_dtype="auto"
         )
-        # global_llm = LLMEngine.from_engine_args(
-        #     model=model_dir,
-        #     max_model_len=8192,
-        #     gpu_memory_utilization=0.9,
-        #     tensor_parallel_size=1,
-        #     max_num_batched_tokens=16384,
-        #     max_num_seqs=32,
-        #     enable_prefix_caching=True
-        # )
+        global_tokenizer = AutoTokenizer.from_pretrained(
+            model_dir
+        )
+        logger.info("全局模型实例初始化完成")
 
-        logger.info("全局LLM实例初始化完成，优化配置已启用")
-
-class VLLMInference:
-    def __init__(self, llm_instance: LLM, sampling_params: SamplingParams):
-        self.llm = llm_instance
-        self.sampling_params = sampling_params
+class TransformersInference:
+    def __init__(self, model, tokenizer):
+        self.model = model
+        self.tokenizer = tokenizer
 
     def generate(self, prompt: str) -> str:
         logger.info(f"正在生成响应，输入长度: {len(prompt)}")
         start_time = time.time()
         
-        with processing_lock:
-            outputs = self.llm.generate([prompt], self.sampling_params)
-
-        # future = self.llm.generate_async([prompt], sampling_params=self.sampling_params)
-        # outputs = future.result()
-
+        inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
+        with torch.no_grad():
+            outputs = self.model.generate(
+                **inputs,
+                max_new_tokens=2048,
+                temperature=0.8,
+                top_p=0.95,
+                do_sample=True
+            )
+        
         duration = time.time() - start_time
-        logger.info(f"vLLM生成完成，耗时: {duration:.2f}秒")
-        return outputs[0].outputs[0].text
+        logger.info(f"Transformers生成完成，耗时: {duration:.2f}秒")
+        return self.tokenizer.decode(outputs[0], skip_special_tokens=True)
 
 def format_chat_messages(messages):
     """将OpenAI格式的消息转换为模型输入"""
@@ -91,7 +84,7 @@ def format_chat_messages(messages):
     return formatted_text.strip()
 
 # 在应用启动时初始化模型
-initialize_llm()
+initialize_model()
 
 @app.route('/v1/chat/completions', methods=['POST'])
 def chat_completions():
@@ -101,7 +94,7 @@ def chat_completions():
         logger.info(f"收到请求 - IP: {request.remote_addr} - ID: {request_id}")
         logger.info(f"请求内容: {data}")
         
-        # Validate messages structure
+        # 验证消息结构
         if not isinstance(data.get('messages'), list):
             error_msg = 'messages must be a list'
             logger.error(f"请求错误: {error_msg} - ID: {request_id}")
@@ -114,28 +107,11 @@ def chat_completions():
             logger.error(f"请求错误: {error_msg} - ID: {request_id}")
             return jsonify({'error': error_msg}), 400
             
-        # Clear KV cache between requests
-        # try:
-        #     global_llm.reset()
-        #     logger.info(f"KV cache cleared - ID: {request_id}")
-        # except Exception as e:
-        #     logger.warning(f"Failed to clear KV cache: {str(e)} - ID: {request_id}")
-
         # 格式化消息
         input_text = format_chat_messages(messages)
 
         # 创建推理实例
-        inference = VLLMInference(
-            global_llm,
-            SamplingParams(
-                temperature=0.8,  # 提高temperature增加多样性
-                top_p=0.95,  # 提高top_p增加生成质量
-                max_tokens=2048,  # 降低最大生成token数
-                presence_penalty=0.1,  # 添加存在惩罚
-                frequency_penalty=0.1,  # 添加频率惩罚
-                skip_special_tokens=True  # 跳过特殊token
-            )
-        )
+        inference = TransformersInference(global_model, global_tokenizer)
 
         # 记录开始时间
         start_time = time.time()
